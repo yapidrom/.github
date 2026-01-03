@@ -1,0 +1,6 @@
+# CODEOWNERS - Organization-wide defaults
+# Bu dosya, kendi CODEOWNERS dosyası olmayan tüm yapidrom repolarına uygulanır.
+# Repo-specific kurallar için ilgili repo'ya CODEOWNERS ekleyin.
+
+# Default reviewers for all files
+* @faik @ozanacik-ypdrm
