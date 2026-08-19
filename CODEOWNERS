@@ -1,6 +1,10 @@
-# CODEOWNERS - Organization-wide defaults
-# Bu dosya, kendi CODEOWNERS dosyası olmayan tüm yapidrom repolarına uygulanır.
-# Repo-specific kurallar için ilgili repo'ya CODEOWNERS ekleyin.
-
-# Default reviewers for all files
+# ⚠️ BU DOSYA GITHUB TARAFINDAN UYGULANMAZ.
+# GitHub, CODEOWNERS'i org duzeyinde varsayilan "community health" dosyasi olarak DESTEKLEMEZ
+# (desteklenenler: issue/PR sablonlari, CONTRIBUTING, SECURITY, SUPPORT, CODE_OF_CONDUCT, FUNDING, GOVERNANCE).
+# Kanit (2026-08-19): bu dosya varken dokuman repolarinda acilan PR'larda hic kimse otomatik review'a istenmedi.
+#
+# Otomatik reviewer istiyorsaniz ilgili repoya .github/CODEOWNERS ekleyin.
+# Ornek: 7 dokuman reposunda (tazi-docs + 6 submodule) `* @demiryasinoruc` repo bazli tanimli.
+#
+# Asagidaki satir yalniz niyet belgesi olarak birakildi; etkisi yoktur.
 * @ozanacik-ypdrm @demiryasinoruc @ugurkurekci
