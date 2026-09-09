@@ -1,0 +1,144 @@
+name: Issue Link Check
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Yeniden kullanılabilir workflow (yapidrom/.github). Repolar 10 satırlık bir
+# çağırıcı dosyayla bunu çağırır; mantık tek yerde durur.
+#
+# Ne yapar:
+#   PR açılınca / düzenlenince  → gövdede Closes/Fixes/Resolves/Refs #N var mı?
+#                                 bağlı issue Tazı V2 projesinde mi, sprint'te mi,
+#                                 Status'u PR'a uygun mu? Todo ise In Progress'e çeker.
+#   PR dev'e merge olunca       → bağlı issue'ları Ready for Test'e taşır (issue AÇIK kalır).
+#                                 Zaten UAT/Production'daysa geri çekmez.
+#
+# Muaf PR'lar (kontrol atlanır):
+#   - başlık "chore: bump <servis> ref" deseni  (gateway submodule ref bump)
+#   - başlık "docs:" ile başlıyor              (sürüm notu vb.)
+#   - "deploy" etiketi
+#
+# Gerekli secret: PROJECT_TOKEN — org projesine (yapidrom/projects/2) yazabilen
+# PAT (scope: project + repo). GITHUB_TOKEN ProjectV2'ye erişemez.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_call:
+    inputs:
+      project_number:
+        type: number
+        default: 2
+      dev_branch:
+        type: string
+        default: dev
+    secrets:
+      PROJECT_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: write
+
+jobs:
+  check:
+    name: Issue link
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          PROJECT_NUMBER: ${{ inputs.project_number }}
+          DEV_BRANCH: ${{ inputs.dev_branch }}
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const owner = context.repo.owner;
+            const projectNumber = Number(process.env.PROJECT_NUMBER);
+            const event = context.payload.action;   // opened|edited|synchronize|reopened|closed
+            const merged = event === 'closed' && pr.merged && pr.base.ref === process.env.DEV_BRANCH;
+            if (event === 'closed' && !merged) { core.info('Merge edilmeden kapandı — atlanıyor.'); return; }
+
+            // ── Muafiyet ─────────────────────────────────────────────────────
+            const title = pr.title || '';
+            const labels = (pr.labels || []).map(l => l.name);
+            const exempt =
+              /^chore(\([^)]*\))?:\s*bump\b.*\bref\b/i.test(title) ||
+              /^docs(\([^)]*\))?:/i.test(title) ||
+              labels.includes('deploy');
+            if (exempt) { core.info(`Muaf PR: "${title}"`); return; }
+
+            // ── Referansları çöz ─────────────────────────────────────────────
+            const text = `${title}\n\n${pr.body || ''}`;
+            const re = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?)\b\s*:?\s+(?:([\w.-]+)\/([\w.-]+))?#(\d+)/gi;
+            const refs = new Map();   // "repo#n" -> {repo, number}
+            for (const m of text.matchAll(re)) {
+              const repo = m[2] || context.repo.repo;
+              const num = Number(m[3]);
+              if (repo === context.repo.repo && num === pr.number) continue;
+              refs.set(`${repo}#${num}`, { repo, number: num });
+            }
+
+            // Proje okuma/yazma PROJECT_TOKEN ile; PR yorumu GITHUB_TOKEN ile.
+            const gql = async (query, variables) => {
+              const res = await fetch('https://api.github.com/graphql', {
+                method: 'POST',
+                headers: { Authorization: `bearer ${process.env.PROJECT_TOKEN}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ query, variables }),
+              });
+              const j = await res.json();
+              if (j.errors) throw new Error(JSON.stringify(j.errors));
+              return j.data;
+            };
+
+            const fail = async (msg) => {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: pr.number,
+                body: `⛔ **Issue bağlantı kontrolü**\n\n${msg}\n\nKural: \`standards/development/universal/git-workflow.md\` → *Issue Bağlama ve Kapatma*.` });
+              core.setFailed(msg);
+            };
+
+            if (refs.size === 0) {
+              return fail('PR gövdesinde `Closes #N` / `Refs #N` yok. Bu PR hangi issue\'nun işi? ' +
+                          'Issue yoksa önce aç, sonra gövdeye ekle. Ref bump / sürüm notu PR\'ları muaftır.');
+            }
+
+            // ── Proje meta ───────────────────────────────────────────────────
+            const meta = await gql(`query($o:String!,$n:Int!){ organization(login:$o){ projectV2(number:$n){ id
+              status: field(name:"Status"){ ... on ProjectV2SingleSelectField{ id options{ id name } } } } } }`,
+              { o: owner, n: projectNumber });
+            const project = meta.organization.projectV2;
+            const opt = Object.fromEntries(project.status.options.map(o => [o.name, o.id]));
+            const setStatus = (itemId, name) => gql(`mutation($p:ID!,$i:ID!,$f:ID!,$v:String!){
+              updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,value:{singleSelectOptionId:$v}}){ projectV2Item{ id } } }`,
+              { p: project.id, i: itemId, f: project.status.id, v: opt[name] });
+
+            const problems = [], notes = [];
+            for (const { repo, number } of refs.values()) {
+              const tag = `${repo}#${number}`;
+              const d = await gql(`query($o:String!,$r:String!,$n:Int!){ repository(owner:$o,name:$r){ issue(number:$n){ state
+                projectItems(first:10){ nodes{ id project{ number }
+                  status: fieldValueByName(name:"Status"){ ... on ProjectV2ItemFieldSingleSelectValue{ name } }
+                  sprint: fieldValueByName(name:"Sprint"){ ... on ProjectV2ItemFieldIterationValue{ title } } } } } } }`,
+                { o: owner, r: repo, n: number }).catch(() => null);
+              const issue = d && d.repository && d.repository.issue;
+              if (!issue) { problems.push(`${tag}: issue bulunamadı.`); continue; }
+              const item = issue.projectItems.nodes.find(x => x.project.number === projectNumber);
+              if (!item) { problems.push(`${tag}: Tazı V2 projesinde değil. Projeye ekle ve sprint'e al.`); continue; }
+              const status = item.status ? item.status.name : '(boş)';
+              const sprint = item.sprint ? item.sprint.title : null;
+
+              if (merged) {
+                if (['Ready for UAT', 'Ready for Production', 'Done'].includes(status)) { notes.push(`${tag}: ${status} — dokunulmadı.`); continue; }
+                await setStatus(item.id, 'Ready for Test');
+                notes.push(`${tag}: ${status} → Ready for Test`);
+                continue;
+              }
+
+              if (!sprint) { problems.push(`${tag}: sprint'e alınmamış (backlog). Planlanmamış işe PR açılmaz; önce sprint'e al.`); continue; }
+              if (['Pending', 'Pending Reply'].includes(status)) { problems.push(`${tag}: ${status} — karar/cevap bekleyen işe kod yazılmaz, önce blokajı çöz.`); continue; }
+              if (status === 'Done' || issue.state === 'CLOSED') { problems.push(`${tag}: kapalı. Kapanmış işe PR gelmez; yeni issue aç.`); continue; }
+              if (status === 'Todo') { await setStatus(item.id, 'In Progress'); notes.push(`${tag}: Todo → In Progress`); continue; }
+              notes.push(`${tag}: ${status} — uygun.`);
+            }
+
+            if (notes.length) await core.summary.addRaw(notes.map(n => `- ${n}`).join('\n')).write();
+            if (problems.length) return fail(problems.map(p => `- ${p}`).join('\n'));
+            core.info('Issue bağlantı kontrolü geçti.');
