@@ -5,11 +5,17 @@ name: Issue Link Check
 # çağırıcı dosyayla bunu çağırır; mantık tek yerde durur.
 #
 # Ne yapar:
-#   PR açılınca / düzenlenince  → gövdede Closes/Fixes/Resolves/Refs #N var mı?
+#   PR açılınca / düzenlenince  → gövdede Refs #N (ya da Closes/Fixes/Resolves #N) var mı?
 #                                 bağlı issue Tazı V2 projesinde mi, sprint'te mi,
 #                                 Status'u PR'a uygun mu? Todo ise In Progress'e çeker.
+#                                 Mekanik olmayan PR'da Closes/Fixes/Resolves varsa UYARI yorumu
+#                                 yazar (bir kez), PR'ı başarısız kılmaz (K41 a).
 #   PR dev'e merge olunca       → bağlı issue'ları Ready for Test'e taşır (issue AÇIK kalır).
 #                                 Zaten UAT/Production'daysa geri çekmez.
+#
+# K41 (a) — tazi-docs-management surec-kararlari.md: PR kartı `Refs #N` ile bağlar, kapatmaz. `Closes`
+# merge anında issue'yu kapatır, panonun "Item closed → Done" otomasyonu kartı Done'a atar ve
+# RfT/UAT/RfP atlanır. `Closes` yalnız birimsiz ve UAT'siz mekanik PR'larda (ref güncellemesi gibi).
 #
 # Muaf PR'lar (kontrol atlanır):
 #   - başlık "chore: bump <servis> ref" deseni  (gateway submodule ref bump)
@@ -96,8 +102,26 @@ jobs:
             };
 
             if (refs.size === 0) {
-              return fail('PR gövdesinde `Closes #N` / `Refs #N` yok. Bu PR hangi issue\'nun işi? ' +
+              return fail('PR gövdesinde `Refs #N` yok. Bu PR hangi issue\'nun işi? ' +
                           'Issue yoksa önce aç, sonra gövdeye ekle. Ref bump / sürüm notu PR\'ları muaftır.');
+            }
+
+            // ── K41 (a): mekanik olmayan PR'da Closes/Fixes/Resolves → uyarı (başarısız kılmaz) ──
+            // Muaf (mekanik) başlıklar yukarıda döndü; buraya gelen PR mekanik sayılmaz.
+            const kapatan = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s+(?:[\w.-]+\/[\w.-]+)?#\d+/i;
+            if (!merged && kapatan.test(text)) {
+              const isaret = '<!-- k41-closes-uyari -->';
+              const uyari = `${isaret}\n⚠️ **Issue bağlantı kontrolü — K41**\n\nBu PR kartı \`Closes\` / \`Fixes\` / \`Resolves\` ile bağlıyor. ` +
+                'Merge anında issue kapanır, pano kartı Done\'a atar ve Ready for Test → UAT → Production adımları atlanır. ' +
+                'Mekanik PR değilse satırı `Refs #N` yap. (`Closes` yalnız birimsiz ve UAT\'siz mekanik PR\'larda — ref güncellemesi gibi.) ' +
+                'Bu bir uyarıdır; kontrol başarısız sayılmaz.\n\nKural: `tazi-docs-management/planning/surec-kararlari.md` → K41 (a).';
+              try {   // uyarı yorumu yazılamazsa kontrol yine sürer
+                const yorumlar = await github.paginate(github.rest.issues.listComments, { ...context.repo, issue_number: pr.number, per_page: 100 });
+                if (!yorumlar.some(c => (c.body || '').includes(isaret))) {
+                  await github.rest.issues.createComment({ ...context.repo, issue_number: pr.number, body: uyari });
+                }
+              } catch (e) { core.info(`K41 uyarı yorumu yazılamadı: ${e.message}`); }
+              core.warning('K41: mekanik olmayan PR\'da Closes/Fixes/Resolves — Refs #N kullanın.');
             }
 
             // ── Proje meta ───────────────────────────────────────────────────
