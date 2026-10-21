@@ -10,8 +10,11 @@ name: Issue Link Check
 #                                 Status'u PR'a uygun mu? Todo ise In Progress'e çeker.
 #                                 Mekanik olmayan PR'da Closes/Fixes/Resolves varsa UYARI yorumu
 #                                 yazar (bir kez), PR'ı başarısız kılmaz (K41 a).
-#   PR dev'e merge olunca       → bağlı issue'ları Ready for Test'e taşır (issue AÇIK kalır).
-#                                 Zaten UAT/Production'daysa geri çekmez.
+#   PR dev'e merge olunca       → bağlı issue'ları In Test'e taşır (issue AÇIK kalır).
+#                                 Zaten In Test, UAT ya da Production'daysa dokunmaz (aynı değeri
+#                                 yeniden yazmak Status'un updatedAt'ini, yani 3 gün sayacını sıfırlar).
+#                                 In Test (2026-10-21, CTO): bugünkü Ready for Test'in yerini aldı — iş test
+#                                 ortamında, geliştirici deniyor. Panoda In Test yoksa Ready for Test'e taşır.
 #
 # K41 (a) — tazi-docs-management surec-kararlari.md: PR kartı `Refs #N` ile bağlar, kapatmaz. `Closes`
 # merge anında issue'yu kapatır, panonun "Item closed → Done" otomasyonu kartı Done'a atar ve
@@ -112,7 +115,7 @@ jobs:
             if (!merged && kapatan.test(text)) {
               const isaret = '<!-- k41-closes-uyari -->';
               const uyari = `${isaret}\n⚠️ **Issue bağlantı kontrolü — K41**\n\nBu PR kartı \`Closes\` / \`Fixes\` / \`Resolves\` ile bağlıyor. ` +
-                'Merge anında issue kapanır, pano kartı Done\'a atar ve Ready for Test → UAT → Production adımları atlanır. ' +
+                'Merge anında issue kapanır, pano kartı Done\'a atar ve In Test → UAT → Production adımları atlanır. ' +
                 'Mekanik PR değilse satırı `Refs #N` yap. (`Closes` yalnız birimsiz ve UAT\'siz mekanik PR\'larda — ref güncellemesi gibi.) ' +
                 'Bu bir uyarıdır; kontrol başarısız sayılmaz.\n\nKural: `tazi-docs-management/planning/surec-kararlari.md` → K41 (a).';
               try {   // uyarı yorumu yazılamazsa kontrol yine sürer
@@ -150,9 +153,10 @@ jobs:
               const sprint = item.sprint ? item.sprint.title : null;
 
               if (merged) {
-                if (['Ready for UAT', 'Ready for Production', 'Done'].includes(status)) { notes.push(`${tag}: ${status} — dokunulmadı.`); continue; }
-                await setStatus(item.id, 'Ready for Test');
-                notes.push(`${tag}: ${status} → Ready for Test`);
+                if (['In Test', 'Ready for UAT', 'In UAT', 'Ready for Production', 'Done'].includes(status)) { notes.push(`${tag}: ${status} — dokunulmadı.`); continue; }
+                const hedef = opt['In Test'] ? 'In Test' : 'Ready for Test';
+                await setStatus(item.id, hedef);
+                notes.push(`${tag}: ${status} → ${hedef}`);
                 continue;
               }
 
