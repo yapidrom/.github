@@ -17,7 +17,8 @@ name: Kart tarayıcı
 # Kart Tazı V2 (proje 2) panosunda değilse ya da issue kapalıysa atlanır.
 #
 # Elle: `deneme: true` yalnız rapor yazar, karta dokunmaz; `saat` geriye bakılacak saat (varsayılan otomatik).
-# Gerekli secret: PROJECT_TOKEN (org secret, proje + repo okuma/yazma).
+# Kimlik: `tazi-ci` GitHub uygulaması (kişiye bağlı değil; CTO 2026-10-28). Repo secret'ları TAZI_CI_APP_ID ve
+# TAZI_CI_KEY (yalnız bu repoda). Uygulama izinleri: Projects (org) yazma, Issues okuma, Contents ve Pull requests.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -46,13 +47,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.TAZI_CI_APP_ID }}
+          private-key: ${{ secrets.TAZI_CI_KEY }}
+          owner: yapidrom
       - uses: actions/github-script@v7
         env:
-          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
           DENEME: ${{ github.event_name == 'workflow_dispatch' && inputs.deneme || false }}
           SAAT: ${{ github.event_name == 'workflow_dispatch' && inputs.saat || '' }}
         with:
-          github-token: ${{ secrets.PROJECT_TOKEN }}
+          github-token: ${{ steps.app.outputs.token }}
           script: |
             const org = 'yapidrom', projeNo = 2;
             const deneme = String(process.env.DENEME) === 'true';
