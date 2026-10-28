@@ -1,0 +1,89 @@
+name: Issue Link Check yayıcı
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kart otomasyonunu (issue-link-check) bütün repolara ve yeni açılan repolara yayar (CTO, 2026-10-28).
+#
+# Her gün ve elle: arşivlenmemiş, `dev` dalı olan her yapidrom reposunda
+# `.github/workflows/issue-link-check.yml` dosyası `cagirici/issue-link-check.yml` ile aynı mı bakar.
+# Eksik ya da farklıysa o repoda `chore/issue-link-check` dalını açar, dosyayı yazar ve `dev`'e PR açar.
+# Açık yayıcı PR'ı varsa yenisini açmaz.
+#
+# Merge: repo değişkeni (Settings → Variables) YAYICI_MERGE = "true" ise yayıcı açtığı PR'ı squash ile
+# kendisi merge eder; değilse PR açık kalır, CTO merge eder. Karar: CTO.
+#
+# Gerekli secret: YAYICI_TOKEN — org repolarına yazabilen PAT (scope: repo + workflow). İş akışı dosyası
+# yazmak `workflow` yetkisi ister; GITHUB_TOKEN ve PROJECT_TOKEN bunu karşılamayabilir.
+# Elle: `deneme: true` ile yalnız rapor yazar, hiçbir repoya dokunmaz.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '0 6 * * 1-5'   # hafta içi 09:00 TR
+  workflow_dispatch:
+    inputs:
+      deneme:
+        description: 'Yalnız rapor (repoya dokunma)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  yay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/github-script@v7
+        env:
+          YAYICI_TOKEN: ${{ secrets.YAYICI_TOKEN }}
+          MERGE: ${{ vars.YAYICI_MERGE }}
+          DENEME: ${{ github.event_name == 'workflow_dispatch' && inputs.deneme || false }}
+        with:
+          github-token: ${{ secrets.YAYICI_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const org = 'yapidrom';
+            const yol = '.github/workflows/issue-link-check.yml';
+            const dal = 'chore/issue-link-check';
+            const icerik = fs.readFileSync('cagirici/issue-link-check.yml', 'utf8');
+            const deneme = String(process.env.DENEME) === 'true';
+            const merge = String(process.env.MERGE) === 'true';
+            const repolar = await github.paginate(github.rest.repos.listForOrg, { org, per_page: 100, type: 'all' });
+            const sonuc = [];
+            for (const r of repolar.filter(x => !x.archived && !x.disabled)) {
+              const repo = r.name;
+              try { await github.rest.repos.getBranch({ owner: org, repo, branch: 'dev' }); } catch { continue; }
+              let mevcut = null;
+              try {
+                const f = await github.rest.repos.getContent({ owner: org, repo, path: yol, ref: 'dev' });
+                mevcut = Buffer.from(f.data.content, 'base64').toString('utf8');
+              } catch {}
+              if (mevcut && mevcut.replace(/\r/g, '') === icerik.replace(/\r/g, '')) continue;
+              const acik = await github.rest.pulls.list({ owner: org, repo, state: 'open', head: `${org}:${dal}` });
+              if (acik.data.length) { sonuc.push(`${repo}: açık PR var (#${acik.data[0].number})`); continue; }
+              if (deneme) { sonuc.push(`${repo}: ${mevcut ? 'farklı' : 'yok'} — deneme, dokunulmadı`); continue; }
+              try {
+                const dev = await github.rest.repos.getBranch({ owner: org, repo, branch: 'dev' });
+                try { await github.rest.git.deleteRef({ owner: org, repo, ref: `heads/${dal}` }); } catch {}
+                await github.rest.git.createRef({ owner: org, repo, ref: `refs/heads/${dal}`, sha: dev.data.commit.sha });
+                let sha;
+                try { sha = (await github.rest.repos.getContent({ owner: org, repo, path: yol, ref: dal })).data.sha; } catch {}
+                await github.rest.repos.createOrUpdateFileContents({ owner: org, repo, path: yol, branch: dal, sha,
+                  message: 'chore(ci): issue-link-check çağırıcısı (yayıcı) [skip ci]',
+                  content: Buffer.from(icerik).toString('base64') });
+                const pr = await github.rest.pulls.create({ owner: org, repo, base: 'dev', head: dal,
+                  title: 'chore(ci): issue-link-check çağırıcısı',
+                  body: 'Kart otomasyonu (dal açılınca In Progress, PR kontrolü, merge sonrası In Test) bu repoya da kuruluyor. ' +
+                        'İçerik `yapidrom/.github` → `cagirici/issue-link-check.yml`; servis koduna dokunmaz, deploy tetiklemez. ' +
+                        'Yayıcı iş akışı açtı (CTO kararı, 2026-10-28).' });
+                if (merge) {
+                  await github.rest.pulls.merge({ owner: org, repo, pull_number: pr.data.number, merge_method: 'squash' });
+                  sonuc.push(`${repo}: ${mevcut ? 'güncellendi' : 'kuruldu'} (#${pr.data.number}, merge)`);
+                } else {
+                  sonuc.push(`${repo}: PR açıldı #${pr.data.number}`);
+                }
+              } catch (e) { sonuc.push(`${repo}: HATA ${e.message}`); }
+            }
+            await core.summary.addRaw(sonuc.length ? sonuc.map(s => `- ${s}`).join('\n') : 'Bütün repolar güncel.').write();
+            core.info(sonuc.join('\n') || 'Bütün repolar güncel.');

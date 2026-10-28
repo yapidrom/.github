@@ -1,0 +1,18 @@
+# Her servis reposuna: .github/workflows/issue-link-check.yml
+# Mantık yapidrom/.github'daki yeniden kullanılabilir workflow'da; burası yalnız çağırır.
+# Bu dosyanın tek kaynağı yapidrom/.github → cagirici/issue-link-check.yml; yayici.yml eksik ya da
+# farklı olan repolara bu içeriği PR olarak açar. Repoda elle değiştirme, kaynağı değiştir.
+name: Issue Link Check
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review, closed]
+    branches: [dev]
+  push:
+    branches-ignore: [dev, master, main]
+
+jobs:
+  issue-link:
+    uses: yapidrom/.github/.github/workflows/issue-link-check.yml@main
+    secrets:
+      PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}

@@ -16,6 +16,9 @@ name: Issue Link Check
 #                                 yorum yazılır — review isteği kutular dolmadan TL'ye gitmesin diye.
 #                                 PR'ı CTO (demiryasinoruc) açtıysa atlanır: kendi PR'ını review'sız merge eder.
 #                                 Çağıran repo `ready_for_review` olayını da dinlemeli.
+#   Dal açılınca (push)         → dal adında kart numarası varsa (`feature/264-…`) aynı repodaki kart Todo'daysa
+#                                 In Progress'e çekilir (2026-10-28, CTO). Çağıran repo dev/master/main dışı
+#                                 dallarda `push` olayını dinlemeli. PR açılınca taşıma yedek olarak kalır.
 #   PR dev'e merge olunca       → bağlı issue'ları In Test'e taşır (issue AÇIK kalır).
 #                                 Zaten In Test, UAT ya da Production'daysa dokunmaz (aynı değeri
 #                                 yeniden yazmak Status'un updatedAt'ini, yani 3 gün sayacını sıfırlar).
@@ -29,6 +32,7 @@ name: Issue Link Check
 # Muaf PR'lar (kontrol atlanır):
 #   - başlık "chore: bump <servis> ref" deseni  (gateway submodule ref bump)
 #   - başlık "docs:" ile başlıyor              (sürüm notu vb.)
+#   - başlık "chore(ci): issue-link-check …"    (yayici.yml'nin açtığı çağırıcı PR'ı)
 #   - "deploy" etiketi
 #
 # Gerekli secret: PROJECT_TOKEN — org projesine (yapidrom/projects/2) yazabilen
@@ -65,9 +69,45 @@ jobs:
           DEV_BRANCH: ${{ inputs.dev_branch }}
         with:
           script: |
-            const pr = context.payload.pull_request;
             const owner = context.repo.owner;
             const projectNumber = Number(process.env.PROJECT_NUMBER);
+
+            // ── Dal açılınca kart In Progress'e (2026-10-28, CTO) ───────────
+            // Çağıran repo dev/master/main dışındaki dallarda `push` olayını dinler. Dal adında kart
+            // numarası varsa (`feature/264-basic-iade`, `fix/301-…` ya da GitHub'ın "Create a branch"
+            // adı `264-…`) aynı repodaki kart Todo'daysa (ya da Status boşsa) In Progress'e çekilir.
+            // Başka durumdaki karta dokunulmaz; numarasız dal sessizce geçer (yedek: PR açılınca).
+            if (context.eventName === 'push') {
+              const dal = (context.ref || '').replace(/^refs\/heads\//, '');
+              const m = dal.match(/^(?:[A-Za-z]+\/)?(\d+)-/);
+              if (!m) { core.info(`Dal adında kart numarası yok: ${dal}`); return; }
+              const no = Number(m[1]);
+              const q = async (query, variables) => {
+                const res = await fetch('https://api.github.com/graphql', { method: 'POST',
+                  headers: { Authorization: `bearer ${process.env.PROJECT_TOKEN}`, 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ query, variables }) });
+                const j = await res.json(); if (j.errors) throw new Error(JSON.stringify(j.errors)); return j.data;
+              };
+              const d = await q(`query($o:String!,$r:String!,$n:Int!,$p:Int!){
+                organization(login:$o){ projectV2(number:$p){ id status: field(name:"Status"){ ... on ProjectV2SingleSelectField{ id options{ id name } } } } }
+                repository(owner:$o,name:$r){ issue(number:$n){ state projectItems(first:10){ nodes{ id project{ number }
+                  status: fieldValueByName(name:"Status"){ ... on ProjectV2ItemFieldSingleSelectValue{ name } } } } } } }`,
+                { o: owner, r: context.repo.repo, n: no, p: projectNumber }).catch(e => { core.info(`Okunamadı: ${e.message}`); return null; });
+              const issue = d && d.repository && d.repository.issue;
+              if (!issue || issue.state !== 'OPEN') { core.info(`#${no} açık issue değil — atlanıyor.`); return; }
+              const item = issue.projectItems.nodes.find(x => x.project.number === projectNumber);
+              if (!item) { core.info(`#${no} Tazı V2'de değil — atlanıyor.`); return; }
+              const st = item.status ? item.status.name : '';
+              if (st && st !== 'Todo') { core.info(`#${no}: ${st} — dokunulmadı.`); return; }
+              const proj = d.organization.projectV2;
+              const ip = proj.status.options.find(o => o.name === 'In Progress');
+              await q(`mutation($p:ID!,$i:ID!,$f:ID!,$v:String!){ updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,value:{singleSelectOptionId:$v}}){ projectV2Item{ id } } }`,
+                { p: proj.id, i: item.id, f: proj.status.id, v: ip.id });
+              core.info(`#${no}: ${st || '(boş)'} → In Progress (dal ${dal})`);
+              return;
+            }
+
+            const pr = context.payload.pull_request;
             const event = context.payload.action;   // opened|edited|synchronize|reopened|ready_for_review|closed
             const merged = event === 'closed' && pr.merged && pr.base.ref === process.env.DEV_BRANCH;
             if (event === 'closed' && !merged) { core.info('Merge edilmeden kapandı — atlanıyor.'); return; }
@@ -78,6 +118,7 @@ jobs:
             const exempt =
               /^chore(\([^)]*\))?:\s*bump\b.*\bref\b/i.test(title) ||
               /^docs(\([^)]*\))?:/i.test(title) ||
+              /^chore\(ci\):\s*issue-link-check/i.test(title) ||   // yayici.yml'nin çağırıcı PR'ı
               labels.includes('deploy');
             if (exempt) { core.info(`Muaf PR: "${title}"`); return; }
 
