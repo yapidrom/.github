@@ -21,9 +21,8 @@ name: Kart tarayıcı
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
-  # Takvim, deneme çalıştırmasının raporu CTO'ya gösterildikten sonra ayrı PR'la açılır:
-  # schedule:
-  #   - cron: '0 6-15 * * 1-5'   # UTC = 09:00–18:00 TR, pazartesi–cuma
+  schedule:
+    - cron: '0 6-15 * * 1-5'   # UTC = 09:00–18:00 TR, pazartesi–cuma (CTO 2026-10-28; uçtan uca denendi, .github#11)
   workflow_dispatch:
     inputs:
       deneme:
