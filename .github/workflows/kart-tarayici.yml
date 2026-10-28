@@ -59,6 +59,7 @@ jobs:
       - uses: actions/github-script@v7
         env:
           DENEME: ${{ github.event_name == 'workflow_dispatch' && inputs.deneme || false }}
+          PR_KONTROL_YAZ: ${{ vars.PR_KONTROL_YAZ }}
           SAAT: ${{ github.event_name == 'workflow_dispatch' && inputs.saat || '' }}
         with:
           github-token: ${{ steps.app.outputs.token }}
@@ -174,6 +175,8 @@ jobs:
             const acikPrler = await github.paginate(github.rest.search.issuesAndPullRequests,
               { q: `org:${org} is:pr is:open base:dev updated:>=${sinceIso}`, per_page: 100 });
             const prRapor = [];
+            // PR'lara yazma yalnız repo değişkeni PR_KONTROL_YAZ = "true" iken (CTO onayı); değilse yalnız rapor.
+            const prYaz = !deneme && String(process.env.PR_KONTROL_YAZ) === 'true';
             for (const p0 of acikPrler) {
               const repo = p0.repository_url.split('/').pop();
               const pr = (await github.rest.pulls.get({ owner: org, repo, pull_number: p0.number })).data;
@@ -215,7 +218,7 @@ jobs:
                   (taslagaCek ? '\nKutular boşken review istendiği için PR taslağa geri çekildi. Kutuları işaretleyip yeniden **Ready for review** de.\n' : '') +
                   '\nKurallar: `tazi-docs-management/planning/calisma-kurallari.md` §3–§4, `surec-kararlari.md` K41. Düzeltince bir sonraki turda bu yorum güncellenir.';
                 prRapor.push(`${repo}#${pr.number}: ${sorun.length} sorun, ${uyari.length} uyarı${taslagaCek ? ', taslağa çekilecek' : ''}`);
-                if (!deneme) {
+                if (prYaz) {
                   if (eski) { if (eski.body !== metin) await github.rest.issues.updateComment({ owner: org, repo, comment_id: eski.id, body: metin }); }
                   else await github.rest.issues.createComment({ owner: org, repo, issue_number: pr.number, body: metin });
                   if (sorun.length && !etiketVar) await github.rest.issues.addLabels({ owner: org, repo, issue_number: pr.number, labels: ['kontrol-eksik'] });
@@ -224,13 +227,13 @@ jobs:
                 }
               } else if (eski || etiketVar) {
                 prRapor.push(`${repo}#${pr.number}: düzeldi`);
-                if (!deneme) {
+                if (prYaz) {
                   if (eski) await github.rest.issues.updateComment({ owner: org, repo, comment_id: eski.id, body: `${isaret}\n✅ **PR kontrolü** — süreç kontrolleri tamam (kart tarayıcı).` });
                   if (etiketVar) await github.rest.issues.removeLabel({ owner: org, repo, issue_number: pr.number, name: 'kontrol-eksik' }).catch(() => {});
                 }
               }
             }
-            rapor.push(...prRapor.map(s => `PR kontrolü — ${s}`));
+            rapor.push(...prRapor.map(s => `PR kontrolü${prYaz ? '' : ' (yalnız rapor)'} — ${s}`));
 
             const ozet = rapor.length ? rapor.map(s => `- ${s}`).join('\n') : 'Taşınacak kart yok.';
             await core.summary.addRaw(`Geriye bakış ${saat} saat${deneme ? ' (deneme, karta dokunulmadı)' : ''}\n\n${ozet}\n`).write();
