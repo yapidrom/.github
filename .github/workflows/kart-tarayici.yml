@@ -1,0 +1,142 @@
+name: Kart tarayıcı
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kart durumunu bütün org için tek yerden taşır (CTO, 2026-10-28). Repo başına çağırıcı gerekmez,
+# yeni repolar kendiliğinden kapsanır. Maliyet sabit: hafta içi 09:00–18:00 TR saatte bir (~220 dk/ay).
+#
+# Her turda, son turdan bu yana (pazartesi ilk turda cuma akşamından bu yana):
+#   1. Dal → In Progress: bu pencerede yeni commit almış, adında kart numarası olan dal (`feature/264-…`,
+#      `fix/301-…`, GitHub'ın `264-…` adı) varsa aynı repodaki kart **aktif sprint'teyse** ve Todo'daysa (ya da
+#      Status boşsa) In Progress'e çekilir. Eski/unutulmuş dal ve sprint dışı kart taşınmaz; commit'siz yeni dal
+#      ilk commit gönderilince yakalanır.
+#   2. Merge → In Test: `dev`'e merge olmuş PR'ın gövdesindeki kartlar (`Refs #N`, `Closes #N`, başka repo için
+#      `Refs yapidrom/<repo>#N`) In Test'ten gerideyse (Todo, In Progress, Pending, Pending Reply, Ready for Test,
+#      boş) In Test'e taşınır. Zaten In Test ya da sonrasındaysa dokunulmaz.
+# Yalnız ileri taşır, geri almaz; personelin elle taşıması serbesttir (kural §3: geçiş insanın; tarayıcı yedek).
+# Muaf PR: başlık "chore: bump … ref", "docs:"; `deploy` etiketi (issue-link-check ile aynı).
+# Kart Tazı V2 (proje 2) panosunda değilse ya da issue kapalıysa atlanır.
+#
+# Elle: `deneme: true` yalnız rapor yazar, karta dokunmaz; `saat` geriye bakılacak saat (varsayılan otomatik).
+# Gerekli secret: PROJECT_TOKEN (org secret, proje + repo okuma/yazma).
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  # Takvim, deneme çalıştırmasının raporu CTO'ya gösterildikten sonra ayrı PR'la açılır:
+  # schedule:
+  #   - cron: '0 6-15 * * 1-5'   # UTC = 09:00–18:00 TR, pazartesi–cuma
+  workflow_dispatch:
+    inputs:
+      deneme:
+        description: 'Yalnız rapor (karta dokunma)'
+        type: boolean
+        default: true
+      saat:
+        description: 'Geriye bakılacak saat (boş = otomatik)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kart-tarayici
+  cancel-in-progress: false
+
+jobs:
+  tara:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          DENEME: ${{ github.event_name == 'workflow_dispatch' && inputs.deneme || false }}
+          SAAT: ${{ github.event_name == 'workflow_dispatch' && inputs.saat || '' }}
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const org = 'yapidrom', projeNo = 2;
+            const deneme = String(process.env.DENEME) === 'true';
+            const simdi = new Date();
+            // Geriye bakış: son turdan bu yana + 10 dk pay. Pazartesi ilk tur (06 UTC) cuma 15 UTC'den beri.
+            let saat = Number(process.env.SAAT || 0);
+            if (!saat) saat = (simdi.getUTCDay() === 1 && simdi.getUTCHours() <= 6) ? 64 : 1;
+            const since = new Date(simdi.getTime() - (saat * 60 + 10) * 60000);
+            const sinceIso = since.toISOString().replace(/\.\d+Z$/, 'Z');
+            core.info(`Geriye bakış: ${saat} saat (${sinceIso}'den beri)${deneme ? ' — DENEME' : ''}`);
+
+            const gql = (q, v) => github.graphql(q, v);
+            const proje = (await gql(`query($o:String!,$n:Int!){ organization(login:$o){ projectV2(number:$n){ id
+              status: field(name:"Status"){ ... on ProjectV2SingleSelectField{ id options{ id name } } } } } }`,
+              { o: org, n: projeNo })).organization.projectV2;
+            const secenek = Object.fromEntries(proje.status.options.map(o => [o.name, o.id]));
+            const kartOku = async (repo, no) => {
+              const d = await gql(`query($o:String!,$r:String!,$n:Int!){ repository(owner:$o,name:$r){ issue(number:$n){ state
+                projectItems(first:10){ nodes{ id project{ number }
+                  status: fieldValueByName(name:"Status"){ ... on ProjectV2ItemFieldSingleSelectValue{ name } }
+                  sprint: fieldValueByName(name:"Sprint"){ ... on ProjectV2ItemFieldIterationValue{ title } } } } } } }`,
+                { o: org, r: repo, n: no }).catch(() => null);
+              const is = d && d.repository && d.repository.issue;
+              if (!is || is.state !== 'OPEN') return null;
+              const it = is.projectItems.nodes.find(x => x.project.number === projeNo);
+              return it ? { id: it.id, status: it.status ? it.status.name : '', sprint: it.sprint ? it.sprint.title : null } : null;
+            };
+            const tasi = (itemId, hedef) => gql(`mutation($p:ID!,$i:ID!,$f:ID!,$v:String!){
+              updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,value:{singleSelectOptionId:$v}}){ projectV2Item{ id } } }`,
+              { p: proje.id, i: itemId, f: proje.status.id, v: secenek[hedef] });
+            const rapor = [];
+            const islendi = new Set();
+
+            // ── 1. Dal → In Progress ────────────────────────────────────────────
+            // Yalnız bu pencerede yeni commit almış numaralı dal ve yalnız aktif sprint'teki kart (eski, unutulmuş
+            // dallar ya da sprint dışı kartlar taşınmaz). Commit'siz yeni dal, ilk commit gönderilince yakalanır.
+            const iter = (await gql(`query($o:String!,$n:Int!){ organization(login:$o){ projectV2(number:$n){
+              field(name:"Sprint"){ ... on ProjectV2IterationField{ configuration{ iterations{ title startDate duration } } } } } } }`,
+              { o: org, n: projeNo })).organization.projectV2.field.configuration.iterations
+              .find(x => { const b = new Date(x.startDate + 'T00:00:00Z'); return b <= simdi && simdi < new Date(b.getTime() + x.duration * 86400000); });
+            const aktifSprint = iter ? iter.title : null;
+            core.info(`Aktif sprint: ${aktifSprint || 'yok'}`);
+            const repolar = await github.paginate(github.rest.search.repos,
+              { q: `org:${org} pushed:>=${sinceIso} archived:false`, per_page: 100 });
+            for (const r of (aktifSprint ? repolar : [])) {
+              const refs = await gql(`query($o:String!,$r:String!){ repository(owner:$o,name:$r){
+                refs(refPrefix:"refs/heads/", first:100, orderBy:{field:TAG_COMMIT_DATE, direction:DESC}){
+                  nodes{ name target{ ... on Commit{ committedDate } } } } } }`, { o: org, r: r.name })
+                .then(d => d.repository.refs.nodes).catch(() => []);
+              for (const b of refs) {
+                const m = b.name.match(/^(?:[A-Za-z]+\/)?(\d+)-/);
+                if (!m || !b.target || !b.target.committedDate || new Date(b.target.committedDate) < since) continue;
+                const anahtar = `${r.name}#${m[1]}`;
+                if (islendi.has(anahtar)) continue; islendi.add(anahtar);
+                const k = await kartOku(r.name, Number(m[1]));
+                if (!k || (k.status && k.status !== 'Todo') || k.sprint !== aktifSprint) continue;
+                if (!deneme) await tasi(k.id, 'In Progress');
+                rapor.push(`${anahtar}: ${k.status || '(boş)'} → In Progress (dal ${b.name})`);
+              }
+            }
+
+            // ── 2. Merge → In Test ──────────────────────────────────────────────
+            const geride = ['', 'Todo', 'In Progress', 'Pending', 'Pending Reply', 'Ready for Test'];
+            const hedefTest = secenek['In Test'] ? 'In Test' : 'Ready for Test';
+            const prler = await github.paginate(github.rest.search.issuesAndPullRequests,
+              { q: `org:${org} is:pr is:merged base:dev merged:>=${sinceIso}`, per_page: 100 });
+            const re = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?)\b\s*:?\s+(?:([\w.-]+)\/([\w.-]+))?#(\d+)/gi;
+            for (const p of prler) {
+              const repo = p.repository_url.split('/').pop();
+              const baslik = p.title || '';
+              const etiket = (p.labels || []).map(l => l.name);
+              if (/^chore(\([^)]*\))?:\s*bump\b.*\bref\b/i.test(baslik) || /^docs(\([^)]*\))?:/i.test(baslik) || etiket.includes('deploy')) continue;
+              for (const m of `${baslik}\n\n${p.body || ''}`.matchAll(re)) {
+                const r2 = m[2] || repo, no = Number(m[3]);
+                if (r2 === repo && no === p.number) continue;
+                const anahtar = `${r2}#${no}`;
+                const k = await kartOku(r2, no);
+                if (!k || !geride.includes(k.status)) continue;
+                if (!deneme) await tasi(k.id, hedefTest);
+                rapor.push(`${anahtar}: ${k.status || '(boş)'} → ${hedefTest} (PR ${repo}#${p.number} merge)`);
+              }
+            }
+
+            const ozet = rapor.length ? rapor.map(s => `- ${s}`).join('\n') : 'Taşınacak kart yok.';
+            await core.summary.addRaw(`Geriye bakış ${saat} saat${deneme ? ' (deneme, karta dokunulmadı)' : ''}\n\n${ozet}\n`).write();
+            core.info(ozet);
