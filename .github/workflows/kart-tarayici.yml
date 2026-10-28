@@ -182,8 +182,11 @@ jobs:
               const repo = p0.repository_url.split('/').pop();
               const pr = (await github.rest.pulls.get({ owner: org, repo, pull_number: p0.number })).data;
               const baslik = pr.title || '', etiket = (pr.labels || []).map(l => l.name);
-              if (/^chore(\([^)]*\))?:\s*bump\b.*\bref\b/i.test(baslik) || /^docs(\([^)]*\))?:/i.test(baslik) || etiket.includes('deploy')) continue;
               const yazar = (pr.user && pr.user.login) || '';
+              // Muaf: ref bump ve gateway alt servis güncellemesi (`chore(x): gitlink bump`, `chore: bump … ref`), `docs:`,
+              // `deploy` etiketi; CTO'nun PR'ı tamamen (kendi PR'ını review'sız merge eder; CTO 2026-10-28).
+              if (/^chore(\([^)]*\))?:.*\b(bump|gitlink)\b/i.test(baslik) || /^docs(\([^)]*\))?:/i.test(baslik)
+                  || etiket.includes('deploy') || yazar === 'demiryasinoruc') continue;
               const bot = (pr.user && pr.user.type === 'Bot') || /\[bot\]$/.test(yazar);
               const govde = (pr.body || '').replace(/\r/g, '');
               const sorun = [], uyari = [];
