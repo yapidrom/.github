@@ -165,7 +165,8 @@ jobs:
               if (!is) return `${repo}#${no}: issue bulunamadı.`;
               if (is.state !== 'OPEN') return `${repo}#${no}: kapalı. Kapanmış işe PR gelmez; yeni kart aç.`;
               const it = is.projectItems.nodes.find(x => x.project.number === projeNo);
-              if (!it) return `${repo}#${no}: Tazı V2 panosunda değil.`;
+              // Kendi panosunda planlanan iş (ör. Bisiklet Taksi #15): kart orada bir sprint'teyse sorun değil.
+              if (!it) return is.projectItems.nodes.some(x => x.sprint) ? null : `${repo}#${no}: Tazı V2 panosunda değil.`;
               const st = it.status ? it.status.name : '';
               if (!it.sprint) return `${repo}#${no}: sprint'e alınmamış. Planlanmamış işe PR açılmaz; Sprint alanını PM ya da CTO değiştirir (K53).`;
               if (['Pending', 'Pending Reply'].includes(st)) return `${repo}#${no}: ${st} — karar ya da cevap bekleyen işe kod yazılmaz, önce blokaj çözülür.`;
