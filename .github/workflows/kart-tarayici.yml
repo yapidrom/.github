@@ -5,8 +5,10 @@ name: Kart tarayıcı
 # yeni repolar kendiliğinden kapsanır. Maliyet sabit: hafta içi 09:00–18:00 TR saatte bir (~220 dk/ay).
 #
 # Her turda, son turdan bu yana (pazartesi ilk turda cuma akşamından bu yana):
-#   1. Dal → In Progress: push almış repolarda adında kart numarası olan dal (`feature/264-…`, `fix/301-…`,
-#      GitHub'ın `264-…` adı) varsa aynı repodaki kart Todo'daysa (ya da Status boşsa) In Progress'e çekilir.
+#   1. Dal → In Progress: bu pencerede yeni commit almış, adında kart numarası olan dal (`feature/264-…`,
+#      `fix/301-…`, GitHub'ın `264-…` adı) varsa aynı repodaki kart **aktif sprint'teyse** ve Todo'daysa (ya da
+#      Status boşsa) In Progress'e çekilir. Eski/unutulmuş dal ve sprint dışı kart taşınmaz; commit'siz yeni dal
+#      ilk commit gönderilince yakalanır.
 #   2. Merge → In Test: `dev`'e merge olmuş PR'ın gövdesindeki kartlar (`Refs #N`, `Closes #N`, başka repo için
 #      `Refs yapidrom/<repo>#N`) In Test'ten gerideyse (Todo, In Progress, Pending, Pending Reply, Ready for Test,
 #      boş) In Test'e taşınır. Zaten In Test ya da sonrasındaysa dokunulmaz.
@@ -19,8 +21,9 @@ name: Kart tarayıcı
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
-  schedule:
-    - cron: '0 6-15 * * 1-5'   # UTC = 09:00–18:00 TR, pazartesi–cuma
+  # Takvim, deneme çalıştırmasının raporu CTO'ya gösterildikten sonra ayrı PR'la açılır:
+  # schedule:
+  #   - cron: '0 6-15 * * 1-5'   # UTC = 09:00–18:00 TR, pazartesi–cuma
   workflow_dispatch:
     inputs:
       deneme:
@@ -70,12 +73,13 @@ jobs:
             const kartOku = async (repo, no) => {
               const d = await gql(`query($o:String!,$r:String!,$n:Int!){ repository(owner:$o,name:$r){ issue(number:$n){ state
                 projectItems(first:10){ nodes{ id project{ number }
-                  status: fieldValueByName(name:"Status"){ ... on ProjectV2ItemFieldSingleSelectValue{ name } } } } } } }`,
+                  status: fieldValueByName(name:"Status"){ ... on ProjectV2ItemFieldSingleSelectValue{ name } }
+                  sprint: fieldValueByName(name:"Sprint"){ ... on ProjectV2ItemFieldIterationValue{ title } } } } } } }`,
                 { o: org, r: repo, n: no }).catch(() => null);
               const is = d && d.repository && d.repository.issue;
               if (!is || is.state !== 'OPEN') return null;
               const it = is.projectItems.nodes.find(x => x.project.number === projeNo);
-              return it ? { id: it.id, status: it.status ? it.status.name : '' } : null;
+              return it ? { id: it.id, status: it.status ? it.status.name : '', sprint: it.sprint ? it.sprint.title : null } : null;
             };
             const tasi = (itemId, hedef) => gql(`mutation($p:ID!,$i:ID!,$f:ID!,$v:String!){
               updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,value:{singleSelectOptionId:$v}}){ projectV2Item{ id } } }`,
@@ -84,17 +88,28 @@ jobs:
             const islendi = new Set();
 
             // ── 1. Dal → In Progress ────────────────────────────────────────────
+            // Yalnız bu pencerede yeni commit almış numaralı dal ve yalnız aktif sprint'teki kart (eski, unutulmuş
+            // dallar ya da sprint dışı kartlar taşınmaz). Commit'siz yeni dal, ilk commit gönderilince yakalanır.
+            const iter = (await gql(`query($o:String!,$n:Int!){ organization(login:$o){ projectV2(number:$n){
+              field(name:"Sprint"){ ... on ProjectV2IterationField{ configuration{ iterations{ title startDate duration } } } } } } }`,
+              { o: org, n: projeNo })).organization.projectV2.field.configuration.iterations
+              .find(x => { const b = new Date(x.startDate + 'T00:00:00Z'); return b <= simdi && simdi < new Date(b.getTime() + x.duration * 86400000); });
+            const aktifSprint = iter ? iter.title : null;
+            core.info(`Aktif sprint: ${aktifSprint || 'yok'}`);
             const repolar = await github.paginate(github.rest.search.repos,
               { q: `org:${org} pushed:>=${sinceIso} archived:false`, per_page: 100 });
-            for (const r of repolar) {
-              const dallar = await github.paginate(github.rest.repos.listBranches, { owner: org, repo: r.name, per_page: 100 });
-              for (const b of dallar) {
+            for (const r of (aktifSprint ? repolar : [])) {
+              const refs = await gql(`query($o:String!,$r:String!){ repository(owner:$o,name:$r){
+                refs(refPrefix:"refs/heads/", first:100, orderBy:{field:TAG_COMMIT_DATE, direction:DESC}){
+                  nodes{ name target{ ... on Commit{ committedDate } } } } } }`, { o: org, r: r.name })
+                .then(d => d.repository.refs.nodes).catch(() => []);
+              for (const b of refs) {
                 const m = b.name.match(/^(?:[A-Za-z]+\/)?(\d+)-/);
-                if (!m) continue;
+                if (!m || !b.target || !b.target.committedDate || new Date(b.target.committedDate) < since) continue;
                 const anahtar = `${r.name}#${m[1]}`;
                 if (islendi.has(anahtar)) continue; islendi.add(anahtar);
                 const k = await kartOku(r.name, Number(m[1]));
-                if (!k || (k.status && k.status !== 'Todo')) continue;
+                if (!k || (k.status && k.status !== 'Todo') || k.sprint !== aktifSprint) continue;
                 if (!deneme) await tasi(k.id, 'In Progress');
                 rapor.push(`${anahtar}: ${k.status || '(boş)'} → In Progress (dal ${b.name})`);
               }
