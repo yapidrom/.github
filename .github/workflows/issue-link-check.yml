@@ -10,6 +10,12 @@ name: Issue Link Check
 #                                 Status'u PR'a uygun mu? Todo ise In Progress'e çeker.
 #                                 Mekanik olmayan PR'da Closes/Fixes/Resolves varsa UYARI yorumu
 #                                 yazar (bir kez), PR'ı başarısız kılmaz (K41 a).
+#   Sahiplenme kutuları (2026-10-28, CTO) → gövdedeki "## Sahiplenme" bölümünün kutuları boşsa
+#                                 kontrol kırmızı. PR taslaksa yalnız kırmızı (yorum yok); taslak
+#                                 değilse ("Ready for review" basılmış) PR taslağa geri çekilir ve
+#                                 yorum yazılır — review isteği kutular dolmadan TL'ye gitmesin diye.
+#                                 PR'ı CTO (demiryasinoruc) açtıysa atlanır: kendi PR'ını review'sız merge eder.
+#                                 Çağıran repo `ready_for_review` olayını da dinlemeli.
 #   PR dev'e merge olunca       → bağlı issue'ları In Test'e taşır (issue AÇIK kalır).
 #                                 Zaten In Test, UAT ya da Production'daysa dokunmaz (aynı değeri
 #                                 yeniden yazmak Status'un updatedAt'ini, yani 3 gün sayacını sıfırlar).
@@ -62,7 +68,7 @@ jobs:
             const pr = context.payload.pull_request;
             const owner = context.repo.owner;
             const projectNumber = Number(process.env.PROJECT_NUMBER);
-            const event = context.payload.action;   // opened|edited|synchronize|reopened|closed
+            const event = context.payload.action;   // opened|edited|synchronize|reopened|ready_for_review|closed
             const merged = event === 'closed' && pr.merged && pr.base.ref === process.env.DEV_BRANCH;
             if (event === 'closed' && !merged) { core.info('Merge edilmeden kapandı — atlanıyor.'); return; }
 
@@ -74,6 +80,38 @@ jobs:
               /^docs(\([^)]*\))?:/i.test(title) ||
               labels.includes('deploy');
             if (exempt) { core.info(`Muaf PR: "${title}"`); return; }
+
+            // ── Sahiplenme kutuları (2026-10-28, CTO) ───────────────────────
+            // Kutuları geliştirici PR taslakken işaretler, sonra "Ready for review" der.
+            // Boş kutuyla review'a açılan PR taslağa geri çekilir. CTO'nun PR'ı muaf.
+            let sahiplenmeHata = null;
+            const yazar = (pr.user && pr.user.login) || '';
+            const bot = (pr.user && pr.user.type === 'Bot') || /\[bot\]$/.test(yazar);
+            if (event !== 'closed' && yazar !== 'demiryasinoruc' && !bot) {
+              const govde = (pr.body || '').replace(/\r/g, '');
+              const bolum = govde.match(/^##\s*Sahiplenme\s*$([\s\S]*?)(?=^##\s|^Refs\b|(?![\s\S]))/mi);
+              if (!bolum) {
+                sahiplenmeHata = 'Gövdede `## Sahiplenme` bölümü yok. Gövdeyi `tz-core:pr-write` ile yaz.';
+              } else {
+                const bos = (bolum[1].match(/^\s*[-*]\s*\[ \]/gm) || []).length;
+                const dolu = (bolum[1].match(/^\s*[-*]\s*\[[xX]\]/gm) || []).length;
+                if (bos + dolu === 0) sahiplenmeHata = '`## Sahiplenme` bölümünde kutu yok.';
+                else if (bos > 0) sahiplenmeHata = `${bos} sahiplenme kutusu boş.`;
+              }
+              if (sahiplenmeHata && !pr.draft) {
+                try {
+                  await fetch('https://api.github.com/graphql', {
+                    method: 'POST',
+                    headers: { Authorization: `bearer ${process.env.PROJECT_TOKEN}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: 'mutation($id:ID!){ convertPullRequestToDraft(input:{pullRequestId:$id}){ pullRequest{ isDraft } } }', variables: { id: pr.node_id } }),
+                  });
+                  await github.rest.issues.createComment({ ...context.repo, issue_number: pr.number,
+                    body: `📝 **Sahiplenme kutuları**\n\n${sahiplenmeHata} PR taslağa geri çekildi.\n\n` +
+                          'Kutuları PR sayfasında kendin işaretle (tıklaman yeterli), sonra **Ready for review** de. ' +
+                          'Review isteği o zaman gider.\n\nKural: `tazi-docs-management/planning/calisma-kurallari.md` §4.' });
+                } catch (e) { core.info(`Taslağa çekme ya da yorum yapılamadı: ${e.message}`); }
+              }
+            }
 
             // ── Referansları çöz ─────────────────────────────────────────────
             const text = `${title}\n\n${pr.body || ''}`;
@@ -169,4 +207,5 @@ jobs:
 
             if (notes.length) await core.summary.addRaw(notes.map(n => `- ${n}`).join('\n')).write();
             if (problems.length) return fail(problems.map(p => `- ${p}`).join('\n'));
+            if (sahiplenmeHata) { core.setFailed(`Sahiplenme: ${sahiplenmeHata}`); return; }
             core.info('Issue bağlantı kontrolü geçti.');
