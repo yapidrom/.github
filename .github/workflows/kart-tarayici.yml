@@ -5,10 +5,10 @@ name: Kart tarayıcı
 # yeni repolar kendiliğinden kapsanır. Maliyet sabit: hafta içi 09:00–18:00 TR saatte bir (~220 dk/ay).
 #
 # Her turda, son turdan bu yana (pazartesi ilk turda cuma akşamından bu yana):
-#   1. Dal → In Progress: bu pencerede yeni commit almış, adında kart numarası olan dal (`feature/264-…`,
-#      `fix/301-…`, GitHub'ın `264-…` adı) varsa aynı repodaki kart **aktif sprint'teyse** ve Todo'daysa (ya da
-#      Status boşsa) In Progress'e çekilir. Eski/unutulmuş dal ve sprint dışı kart taşınmaz; commit'siz yeni dal
-#      ilk commit gönderilince yakalanır.
+#   1. Dal → In Progress: bu pencerede push almış (dal açmak dahil) repolarda adında kart numarası olan dal
+#      (`feature/264-…`, `fix/301-…`, GitHub'ın `264-…` adı) varsa aynı repodaki kart **aktif sprint'teyse** ve
+#      Todo'daysa (ya da Status boşsa) In Progress'e çekilir. Commit'siz yeni dal açıldığı saatin turunda yakalanır.
+#      Sprint dışı kart taşınmaz.
 #   2. Merge → In Test: `dev`'e merge olmuş PR'ın gövdesindeki kartlar (`Refs #N`, `Closes #N`, başka repo için
 #      `Refs yapidrom/<repo>#N`) In Test'ten gerideyse (Todo, In Progress, Pending, Pending Reply, Ready for Test,
 #      boş) In Test'e taşınır. Zaten In Test ya da sonrasındaysa dokunulmaz.
@@ -88,8 +88,11 @@ jobs:
             const islendi = new Set();
 
             // ── 1. Dal → In Progress ────────────────────────────────────────────
-            // Yalnız bu pencerede yeni commit almış numaralı dal ve yalnız aktif sprint'teki kart (eski, unutulmuş
-            // dallar ya da sprint dışı kartlar taşınmaz). Commit'siz yeni dal, ilk commit gönderilince yakalanır.
+            // Bu pencerede push almış repolar (dal açmak da repo'nun pushed_at'ini günceller; 2026-10-28'de denendi) ve
+            // onlardaki bütün numaralı dallar. Commit saatine bakılmaz: commit'siz yeni dal açıldığı saatin turunda
+            // yakalanır. Repo olay akışı kullanılmaz: dakikalarca, bazen saatlerce gecikiyor. Yalnız aktif sprint'teki
+            // Todo kart taşınır; sprint dışı kart taşınmaz. Sınır: aynı repodaki eski bir numaralı dalın kartı bu sprint
+            // planlanıp Todo'daysa o da In Progress'e geçer (kartın dalı var).
             const iter = (await gql(`query($o:String!,$n:Int!){ organization(login:$o){ projectV2(number:$n){
               field(name:"Sprint"){ ... on ProjectV2IterationField{ configuration{ iterations{ title startDate duration } } } } } } }`,
               { o: org, n: projeNo })).organization.projectV2.field.configuration.iterations
@@ -99,13 +102,12 @@ jobs:
             const repolar = await github.paginate(github.rest.search.repos,
               { q: `org:${org} pushed:>=${sinceIso} archived:false`, per_page: 100 });
             for (const r of (aktifSprint ? repolar : [])) {
-              const refs = await gql(`query($o:String!,$r:String!){ repository(owner:$o,name:$r){
-                refs(refPrefix:"refs/heads/", first:100, orderBy:{field:TAG_COMMIT_DATE, direction:DESC}){
-                  nodes{ name target{ ... on Commit{ committedDate } } } } } }`, { o: org, r: r.name })
-                .then(d => d.repository.refs.nodes).catch(() => []);
-              for (const b of refs) {
+              const dallar = (await github.paginate(github.rest.repos.listBranches, { owner: org, repo: r.name, per_page: 100 })
+                .catch(() => [])).map(x => x.name);
+              for (const dal of dallar) {
+                const b = { name: dal };
                 const m = b.name.match(/^(?:[A-Za-z]+\/)?(\d+)-/);
-                if (!m || !b.target || !b.target.committedDate || new Date(b.target.committedDate) < since) continue;
+                if (!m) continue;
                 const anahtar = `${r.name}#${m[1]}`;
                 if (islendi.has(anahtar)) continue; islendi.add(anahtar);
                 const k = await kartOku(r.name, Number(m[1]));
