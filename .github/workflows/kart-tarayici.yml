@@ -12,6 +12,9 @@ name: Kart tarayıcı
 #   2. Merge → In Test: `dev`'e merge olmuş PR'ın gövdesindeki kartlar (`Refs #N`, `Closes #N`, başka repo için
 #      `Refs yapidrom/<repo>#N`) In Test'ten gerideyse (Todo, In Progress, Pending, Pending Reply, Ready for Test,
 #      boş) In Test'e taşınır. Zaten In Test ya da sonrasındaysa dokunulmaz.
+#   3. PR kontrolleri: son turdan beri değişmiş, dev'e açık PR'larda sahiplenme kutuları, `Refs #N`, `Closes` uyarısı,
+#      kartın durumu. Sorun varsa PR'a tek yorum (güncellenir) ve `kontrol-eksik` etiketi; kutular boşken review'a
+#      açılmış PR taslağa çekilir. Repo başına issue-link-check pilotunun yerine, bütün org için (CTO 2026-10-28).
 # Yalnız ileri taşır, geri almaz; personelin elle taşıması serbesttir (kural §3: geçiş insanın; tarayıcı yedek).
 # Muaf PR: başlık "chore: bump … ref", "docs:"; `deploy` etiketi (issue-link-check ile aynı).
 # Kart Tazı V2 (proje 2) panosunda değilse ya da issue kapalıysa atlanır.
@@ -143,6 +146,91 @@ jobs:
                 rapor.push(`${anahtar}: ${k.status || '(boş)'} → ${hedefTest} (PR ${repo}#${p.number} merge)`);
               }
             }
+
+            // ── 3. PR kontrolleri (CTO 2026-10-28; issue-link-check pilotunun yerine, bütün org) ──────────
+            // Son turdan beri değişmiş, dev'e açık PR'lar. Kurallar: sahiplenme kutuları (calisma-kurallari §4),
+            // `Refs #N` kart bağı (K41 a), mekanik olmayan PR'da `Closes` uyarısı (K41 a), kart panoda/sprint'te/Pending
+            // değil/açık (§3). Sorun varsa PR'a tek yorum (her turda aynı yorum güncellenir) ve `kontrol-eksik` etiketi;
+            // sorun kalmayınca yorum "tamam"a döner, etiket kalkar. Kutular boşken taslak değilse PR taslağa çekilir.
+            // Muaf: ref bump, `docs:`, `deploy` etiketi; sahiplenme kontrolünden ayrıca CTO ve botlar.
+            const isaret = '<!-- kart-tarayici-pr -->';
+            const kartDurum = async (repo, no) => {
+              const d = await gql(`query($o:String!,$r:String!,$n:Int!){ repository(owner:$o,name:$r){ issue(number:$n){ state
+                projectItems(first:10){ nodes{ project{ number }
+                  status: fieldValueByName(name:"Status"){ ... on ProjectV2ItemFieldSingleSelectValue{ name } }
+                  sprint: fieldValueByName(name:"Sprint"){ ... on ProjectV2ItemFieldIterationValue{ title } } } } } } }`,
+                { o: org, r: repo, n: no }).catch(() => null);
+              const is = d && d.repository && d.repository.issue;
+              if (!is) return `${repo}#${no}: issue bulunamadı.`;
+              if (is.state !== 'OPEN') return `${repo}#${no}: kapalı. Kapanmış işe PR gelmez; yeni kart aç.`;
+              const it = is.projectItems.nodes.find(x => x.project.number === projeNo);
+              if (!it) return `${repo}#${no}: Tazı V2 panosunda değil.`;
+              const st = it.status ? it.status.name : '';
+              if (!it.sprint) return `${repo}#${no}: sprint'e alınmamış. Planlanmamış işe PR açılmaz; Sprint alanını PM ya da CTO değiştirir (K53).`;
+              if (['Pending', 'Pending Reply'].includes(st)) return `${repo}#${no}: ${st} — karar ya da cevap bekleyen işe kod yazılmaz, önce blokaj çözülür.`;
+              if (st === 'Done') return `${repo}#${no}: Done. Kapanmış işe PR gelmez.`;
+              return null;
+            };
+            const acikPrler = await github.paginate(github.rest.search.issuesAndPullRequests,
+              { q: `org:${org} is:pr is:open base:dev updated:>=${sinceIso}`, per_page: 100 });
+            const prRapor = [];
+            for (const p0 of acikPrler) {
+              const repo = p0.repository_url.split('/').pop();
+              const pr = (await github.rest.pulls.get({ owner: org, repo, pull_number: p0.number })).data;
+              const baslik = pr.title || '', etiket = (pr.labels || []).map(l => l.name);
+              if (/^chore(\([^)]*\))?:\s*bump\b.*\bref\b/i.test(baslik) || /^docs(\([^)]*\))?:/i.test(baslik) || etiket.includes('deploy')) continue;
+              const yazar = (pr.user && pr.user.login) || '';
+              const bot = (pr.user && pr.user.type === 'Bot') || /\[bot\]$/.test(yazar);
+              const govde = (pr.body || '').replace(/\r/g, '');
+              const sorun = [], uyari = [];
+              // Sahiplenme kutuları
+              let kutuBos = false;
+              if (yazar !== 'demiryasinoruc' && !bot) {
+                const bolum = govde.match(/^##\s*Sahiplenme\s*$([\s\S]*?)(?=^##\s|^Refs\b|(?![\s\S]))/mi);
+                if (!bolum) { sorun.push('Gövdede `## Sahiplenme` bölümü yok — gövdeyi `tz-core:pr-write` ile yaz.'); kutuBos = true; }
+                else {
+                  const bos = (bolum[1].match(/^\s*[-*]\s*\[ \]/gm) || []).length, dolu = (bolum[1].match(/^\s*[-*]\s*\[[xX]\]/gm) || []).length;
+                  if (bos + dolu === 0) { sorun.push('`## Sahiplenme` bölümünde kutu yok.'); kutuBos = true; }
+                  else if (bos > 0) { sorun.push(`${bos} sahiplenme kutusu boş — PR sayfasında işaretle (tıklaman yeterli).`); kutuBos = true; }
+                }
+              }
+              // Kart bağı ve durumu
+              const refs = [...`${baslik}\n\n${govde}`.matchAll(re)]
+                .map(m => ({ r: m[2] || repo, n: Number(m[3]) })).filter(x => !(x.r === repo && x.n === pr.number));
+              if (!refs.length) sorun.push('Gövdede `Refs #N` yok — bu PR hangi kartın işi? Kart yoksa önce kart açılır.');
+              if (/\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s+(?:[\w.-]+\/[\w.-]+)?#\d+/i.test(govde))
+                uyari.push('Kart `Closes`/`Fixes` ile bağlanmış: merge anında kart Done olur, test ve UAT atlanır. Mekanik PR değilse `Refs #N` yaz (K41 a).');
+              const goruldu = new Set();
+              for (const x of refs) { const a = `${x.r}#${x.n}`; if (goruldu.has(a)) continue; goruldu.add(a);
+                const s2 = await kartDurum(x.r, x.n); if (s2) sorun.push(s2); }
+              // Yorum, etiket, taslak
+              const yorumlar = await github.paginate(github.rest.issues.listComments, { owner: org, repo, issue_number: pr.number, per_page: 100 });
+              const eski = yorumlar.find(c => (c.body || '').includes(isaret));
+              const etiketVar = etiket.includes('kontrol-eksik');
+              const taslagaCek = kutuBos && !pr.draft;
+              if (sorun.length || uyari.length) {
+                const metin = `${isaret}\n🔎 **PR kontrolü** (kart tarayıcı, saat başı)\n\n` +
+                  (sorun.length ? sorun.map(s => `- ⛔ ${s}`).join('\n') + '\n' : '') +
+                  (uyari.length ? uyari.map(s => `- ⚠️ ${s}`).join('\n') + '\n' : '') +
+                  (taslagaCek ? '\nKutular boşken review istendiği için PR taslağa geri çekildi. Kutuları işaretleyip yeniden **Ready for review** de.\n' : '') +
+                  '\nKurallar: `tazi-docs-management/planning/calisma-kurallari.md` §3–§4, `surec-kararlari.md` K41. Düzeltince bir sonraki turda bu yorum güncellenir.';
+                prRapor.push(`${repo}#${pr.number}: ${sorun.length} sorun, ${uyari.length} uyarı${taslagaCek ? ', taslağa çekilecek' : ''}`);
+                if (!deneme) {
+                  if (eski) { if (eski.body !== metin) await github.rest.issues.updateComment({ owner: org, repo, comment_id: eski.id, body: metin }); }
+                  else await github.rest.issues.createComment({ owner: org, repo, issue_number: pr.number, body: metin });
+                  if (sorun.length && !etiketVar) await github.rest.issues.addLabels({ owner: org, repo, issue_number: pr.number, labels: ['kontrol-eksik'] });
+                  if (!sorun.length && etiketVar) await github.rest.issues.removeLabel({ owner: org, repo, issue_number: pr.number, name: 'kontrol-eksik' }).catch(() => {});
+                  if (taslagaCek) await gql('mutation($id:ID!){ convertPullRequestToDraft(input:{pullRequestId:$id}){ pullRequest{ isDraft } } }', { id: pr.node_id });
+                }
+              } else if (eski || etiketVar) {
+                prRapor.push(`${repo}#${pr.number}: düzeldi`);
+                if (!deneme) {
+                  if (eski) await github.rest.issues.updateComment({ owner: org, repo, comment_id: eski.id, body: `${isaret}\n✅ **PR kontrolü** — süreç kontrolleri tamam (kart tarayıcı).` });
+                  if (etiketVar) await github.rest.issues.removeLabel({ owner: org, repo, issue_number: pr.number, name: 'kontrol-eksik' }).catch(() => {});
+                }
+              }
+            }
+            rapor.push(...prRapor.map(s => `PR kontrolü — ${s}`));
 
             const ozet = rapor.length ? rapor.map(s => `- ${s}`).join('\n') : 'Taşınacak kart yok.';
             await core.summary.addRaw(`Geriye bakış ${saat} saat${deneme ? ' (deneme, karta dokunulmadı)' : ''}\n\n${ozet}\n`).write();
